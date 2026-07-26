@@ -1,0 +1,41 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/sbin/transocks-headless
+CONFIG=/etc/config/transocks
+
+start_service() {
+	local enabled
+	config_load transocks
+	config_get_bool enabled main enabled 0
+	[ "$enabled" -eq 1 ] || return 0
+
+	chmod 0600 /etc/transocks/credentials.json 2>/dev/null
+
+	procd_open_instance
+	procd_set_param command "$PROG" daemon -config "$CONFIG"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONFIG" /etc/transocks/credentials.json
+	procd_set_param limits nofile="65536 65536"
+	procd_set_param term_timeout 15
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger transocks
+}
+
+reload_service() {
+	stop
+	start
+}
+
+extra_command "validate" "Validate configuration and credentials"
+validate() {
+	"$PROG" check -config "$CONFIG"
+}

@@ -1,0 +1,30 @@
+# Proprietary analysis input; never publish in the clean-room source feed.
+/official/
+
+# Local credentials, runtime state, and generated core configuration.
+credentials.local.json
+last-known-good.json
+status.json
+sing-box.json
+sing-box.json.candidate
+
+# OpenWrt and Go build outputs.
+*.apk
+*.ipk
+*.bin
+*.img
+*.iso
+*.log
+/bin/
+/build_dir/
+/dl/
+/staging_dir/
+/tmp/
+coverage.out
+
+# Editor and operating-system metadata.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

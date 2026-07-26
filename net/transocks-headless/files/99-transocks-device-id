@@ -1,0 +1,13 @@
+#!/bin/sh
+
+device_id="$(uci -q get transocks.main.device_id)"
+if [ -z "$device_id" ]; then
+	device_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+	[ -n "$device_id" ] || device_id="transocks-$(hexdump -n 8 -e '8/1 "%02x"' /dev/urandom)"
+	uci set transocks.main.device_id="$device_id"
+	uci commit transocks
+fi
+
+chmod 0600 /etc/transocks/credentials.json 2>/dev/null
+exit 0
+

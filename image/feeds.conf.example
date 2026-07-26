@@ -1,0 +1,5 @@
+# Append this line to the OpenWrt tree's feeds.conf.default.
+src-git transocks https://github.com/tardeaux/Transocks-Headless.git;master
+
+# For local development, use this instead:
+# src-link transocks /absolute/path/to/TransocksHeadless
