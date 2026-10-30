@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -138,6 +139,13 @@ func Generate(cfg config.Config, candidates []provider.Candidate) ([]byte, error
 	}
 
 	if cfg.RouteMode == "compatibility" {
+		cachePath := filepath.Join(cfg.RunDir, "sing-box-cache.db")
+		if cfg.CacheFile != "" {
+			cachePath = filepath.Join(filepath.Dir(cfg.CacheFile), "sing-box-cache.db")
+		}
+		document["experimental"].(map[string]any)["cache_file"] = map[string]any{
+			"enabled": true, "path": cachePath,
+		}
 		routeRules = append(routeRules, map[string]any{"rule_set": []string{"geoip-cn"}, "outbound": "auto"})
 		route["rules"] = routeRules
 		route["final"] = "direct"

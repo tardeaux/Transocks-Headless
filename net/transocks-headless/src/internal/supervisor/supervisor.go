@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +27,7 @@ const (
 	maxRuntimeConfigBytes = 4 << 20
 	maxHealthBytes        = 64 << 10
 	stableCoreUptime      = 10 * time.Minute
-	coreStartupGrace      = 2 * time.Second
+	coreStartupGrace      = 30 * time.Second
 )
 
 type providerClient interface {
@@ -47,6 +48,8 @@ type Manager struct {
 	configHash       string
 	coreStartedAt    time.Time
 	stateWriteFailed bool
+	session          provider.Session
+	nextRefreshRetry time.Time
 }
 
 type State struct {
@@ -191,6 +194,9 @@ func (m *Manager) waitForInitialRefresh(ctx context.Context, backoff *time.Durat
 }
 
 func (m *Manager) runScheduledRefresh(ctx context.Context, backoff *time.Duration) time.Duration {
+	if remaining := time.Until(m.nextRefreshRetry); remaining > 0 {
+		return remaining
+	}
 	if err := m.refreshWithTimeout(ctx); err != nil {
 		m.recordRefreshFailure(err)
 		delay := jitterDuration(*backoff)
@@ -209,11 +215,7 @@ func (m *Manager) refreshWithTimeout(ctx context.Context) error {
 }
 
 func (m *Manager) refresh(ctx context.Context) error {
-	session, err := m.client.Authenticate(ctx, m.credentials)
-	if err != nil {
-		return err
-	}
-	candidates, err := m.client.Candidates(ctx, session)
+	candidates, err := m.fetchCandidates(ctx)
 	if err != nil {
 		return err
 	}
@@ -235,12 +237,13 @@ func (m *Manager) refresh(ctx context.Context) error {
 	now := time.Now().UTC()
 	m.state.Status = "running"
 	m.state.UsingCache = false
-	m.state.APIDomain = session.BaseURL
+	m.state.APIDomain = m.session.BaseURL
 	m.state.LastRefresh = now
 	m.state.UpdatedAt = now
 	m.state.LastRefreshError = ""
 	m.state.RefreshFailures = 0
 	m.state.NextRefreshRetry = ""
+	m.nextRefreshRetry = time.Time{}
 	m.state.CandidateCount = len(candidates)
 	m.state.Candidates = make([]CandidateState, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -253,7 +256,45 @@ func (m *Manager) refresh(ctx context.Context) error {
 	return nil
 }
 
+// Keep the bearer token in memory across candidate refreshes. Unknown expiry is
+// usable until the provider explicitly rejects it; network failures do not imply
+// that credentials need to be submitted again.
+func (m *Manager) fetchCandidates(ctx context.Context) ([]provider.Candidate, error) {
+	if m.session.Token == "" || (m.session.TokenExp > 0 &&
+		!time.Unix(m.session.TokenExp, 0).After(time.Now().Add(time.Minute))) {
+		m.session = provider.Session{}
+		session, err := m.client.Authenticate(ctx, m.credentials)
+		if err != nil {
+			return nil, err
+		}
+		m.session = session
+	}
+	candidates, err := m.client.Candidates(ctx, m.session)
+	if !provider.IsAuthenticationError(err) {
+		return candidates, err
+	}
+	m.session = provider.Session{}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	session, err := m.client.Authenticate(ctx, m.credentials)
+	if err != nil {
+		return nil, err
+	}
+	m.session = session
+	candidates, err = m.client.Candidates(ctx, m.session)
+	if provider.IsAuthenticationError(err) {
+		m.session = provider.Session{}
+	}
+	return candidates, err
+}
+
 func (m *Manager) installConfig(ctx context.Context, data []byte, hash string) error {
+	if m.cfg.RouteMode == "compatibility" && m.cfg.CacheFile != "" {
+		if err := os.MkdirAll(filepath.Dir(m.cfg.CacheFile), 0o700); err != nil {
+			return err
+		}
+	}
 	configPath := filepath.Join(m.cfg.RunDir, "sing-box.json")
 	candidatePath := configPath + ".candidate"
 	_ = os.Remove(candidatePath)
@@ -470,6 +511,27 @@ func (m *Manager) observeHealth(ctx context.Context) bool {
 }
 
 func (m *Manager) readCoreHealth(ctx context.Context) (string, int, error) {
+	// A live test touches URLTest so its idle timeout cannot turn an unused
+	// SSID into a false degradation/relogin loop. It also measures the tunnel,
+	// rather than relying solely on an old cached delay.
+	probeTimeout := min(m.cfg.RequestTimeout.Milliseconds(), int64(30000))
+	probeURL := "http://" + m.cfg.APIControllerListen + "/proxies/auto/delay?timeout=" + fmt.Sprint(probeTimeout) + "&url=" + url.QueryEscape(m.cfg.ProbeURL)
+	probeRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	probeResponse, err := m.healthClient.Do(probeRequest)
+	if err != nil {
+		return "", 0, err
+	}
+	_, readErr := readHTTPBody(probeResponse.Body, maxHealthBytes)
+	_ = probeResponse.Body.Close()
+	if readErr != nil {
+		return "", 0, readErr
+	}
+	if probeResponse.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("core delay API HTTP %d", probeResponse.StatusCode)
+	}
 	endpoint := "http://" + m.cfg.APIControllerListen + "/proxies/auto"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -534,7 +596,8 @@ func (m *Manager) recordRefreshFailure(err error) {
 }
 
 func (m *Manager) setNextRefreshRetry(delay time.Duration) {
-	m.state.NextRefreshRetry = time.Now().Add(delay).UTC().Format(time.RFC3339)
+	m.nextRefreshRetry = time.Now().Add(delay)
+	m.state.NextRefreshRetry = m.nextRefreshRetry.UTC().Format(time.RFC3339)
 	m.state.UpdatedAt = time.Now().UTC()
 	m.persistState()
 }

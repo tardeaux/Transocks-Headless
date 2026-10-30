@@ -100,16 +100,30 @@ type apiResult struct {
 	Errors []string `json:"errors"`
 }
 
+// APIError preserves the vendor code without retaining potentially sensitive response text.
+type APIError struct{ Code int }
+
+func (e *APIError) Error() string { return fmt.Sprintf("provider code %d", e.Code) }
+
+type httpError struct{ status int }
+
+func (e *httpError) Error() string { return fmt.Sprintf("provider HTTP %d", e.status) }
+
+func IsAuthenticationError(err error) bool {
+	var api *APIError
+	if errors.As(err, &api) {
+		switch api.Code {
+		case 20001, 20006, 20010, 40015:
+			return true
+		}
+	}
+	var status *httpError
+	return errors.As(err, &status) && status.status == http.StatusUnauthorized
+}
+
 func (r apiResult) validate() error {
-	if r.Code != 0 && r.Code != 20000 && r.Code != 200 {
-		message := r.Error
-		if message == "" {
-			message = strings.Join(r.Errors, "; ")
-		}
-		if message == "" {
-			message = r.Status
-		}
-		return fmt.Errorf("provider code %d: %s", r.Code, message)
+	if r.Code != 0 && r.Code != 200 {
+		return &APIError{Code: r.Code}
 	}
 	return nil
 }
@@ -117,7 +131,11 @@ func (r apiResult) validate() error {
 func (c *Client) Authenticate(ctx context.Context, credentials config.Credentials) (Session, error) {
 	baseURL, err := c.raceDomains(ctx)
 	if err != nil {
-		return Session{}, err
+		if ctx.Err() != nil {
+			return Session{}, ctx.Err()
+		}
+		// Discovery is advisory: a failed IP endpoint need not prevent login.
+		baseURL = ""
 	}
 	body := c.baseRequest()
 	body["auth_by"] = credentials.AuthBy
@@ -146,6 +164,10 @@ func (c *Client) Authenticate(ctx context.Context, credentials config.Credential
 			ExpireAt string `json:"expire_at"`
 		}
 		if err := c.requestJSON(ctx, http.MethodPost, loginBase+"/api/1/login", "", body, &response); err != nil {
+			var api *APIError
+			if errors.As(err, &api) {
+				return Session{}, err
+			}
 			lastErr = err
 			continue
 		}
@@ -197,6 +219,9 @@ func (c *Client) Candidates(ctx context.Context, session Session) ([]Candidate, 
 	for _, base := range bases {
 		response = connectResponse{}
 		if err := c.requestJSON(ctx, http.MethodPost, base+"/api/2/line/connectmultiple", session.Token, body, &response); err != nil {
+			if IsAuthenticationError(err) {
+				return nil, err
+			}
 			lastErr = err
 			continue
 		}
@@ -283,9 +308,8 @@ type remoteProxy struct {
 	Method   string `json:"method"`
 	Host     string `json:"host"`
 	SSL      *struct {
-		Enabled bool   `json:"enabled"`
-		SNI     string `json:"sni"`
-		Verify  bool   `json:"verify"`
+		SNI    string `json:"sni"`
+		Verify *bool  `json:"verify"`
 	} `json:"ssl"`
 	Websocket *struct {
 		Enabled bool   `json:"enabled"`
@@ -332,9 +356,8 @@ func extractCandidates(configs []remoteConfig) []Candidate {
 			candidate.TLS.Enabled = true
 			candidate.TLS.ServerName = trojan.Host
 			if trojan.SSL != nil {
-				candidate.TLS.Enabled = trojan.SSL.Enabled
 				candidate.TLS.ServerName = trojan.SSL.SNI
-				candidate.TLS.Insecure = !trojan.SSL.Verify
+				candidate.TLS.Insecure = trojan.SSL.Verify != nil && !*trojan.SSL.Verify
 			}
 			if candidate.TLS.ServerName == "" {
 				candidate.TLS.ServerName = candidate.Server
@@ -409,8 +432,12 @@ func (c *Client) raceDomains(ctx context.Context) (string, error) {
 					} else {
 						var data []byte
 						data, err = readBounded(response.Body, 64<<10)
-						if err == nil && !json.Valid(data) {
-							err = errors.New("provider probe returned invalid JSON")
+						if err == nil {
+							var result apiResult
+							err = json.Unmarshal(data, &result)
+							if err == nil {
+								err = result.validate()
+							}
 						}
 					}
 				}
@@ -467,7 +494,13 @@ func (c *Client) requestJSON(ctx context.Context, method, endpoint, token string
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", response.StatusCode, truncate(string(data), 256))
+		var result apiResult
+		if json.Unmarshal(data, &result) == nil && result.Code != 0 {
+			if err := result.validate(); err != nil {
+				return err
+			}
+		}
+		return &httpError{status: response.StatusCode}
 	}
 	if err := json.Unmarshal(data, output); err != nil {
 		return fmt.Errorf("decode response: %w", err)

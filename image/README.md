@@ -23,7 +23,7 @@ First build `transocks-headless` with the matching 25.12.5 SDK. Then:
 ```sh
 export IMAGEBUILDER_DIR=/absolute/path/to/openwrt-imagebuilder
 export PROFILE=your_device_profile
-export PACKAGE_FILE=/absolute/path/to/transocks-headless-0.1.0-r2.apk
+export PACKAGE_FILE=/absolute/path/to/transocks-headless-0.1.0-r3.apk
 /absolute/path/to/TransocksHeadless/image/build-imagebuilder.sh
 ```
 

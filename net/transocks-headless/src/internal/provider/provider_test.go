@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -101,7 +102,7 @@ func TestRaceDomainsReturnsFastAndCancelsSlowProbe(t *testing.T) {
 	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-slowStarted
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":20000}`))
+		_, _ = w.Write([]byte(`{"code":0}`))
 	}))
 	defer fast.Close()
 
@@ -157,7 +158,7 @@ func TestRepeatedDomainRacesLeaveNoActiveRequests(t *testing.T) {
 			}
 			return &http.Response{
 				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"code":20000}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"code":0}`)),
 				Header:     make(http.Header),
 			}, nil
 		})},
@@ -218,7 +219,7 @@ func TestCandidateProbesCloseConnections(t *testing.T) {
 func TestAuthenticateFallsBackAfterSelectedDomainFailsLogin(t *testing.T) {
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/1/ip" {
-			_, _ = w.Write([]byte(`{"code":20000}`))
+			_, _ = w.Write([]byte(`{"code":0}`))
 			return
 		}
 		http.Error(w, "temporary failure", http.StatusServiceUnavailable)
@@ -227,10 +228,10 @@ func TestAuthenticateFallsBackAfterSelectedDomainFailsLogin(t *testing.T) {
 	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/1/ip" {
 			time.Sleep(20 * time.Millisecond)
-			_, _ = w.Write([]byte(`{"code":20000}`))
+			_, _ = w.Write([]byte(`{"code":0}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"code":20000,"token":{"access_token":"test","token_type":"Bearer","exp":1}}`))
+		_, _ = w.Write([]byte(`{"code":0,"token":{"access_token":"test","token_type":"Bearer","exp":1}}`))
 	}))
 	defer backup.Close()
 	cfg := config.Defaults()
@@ -259,7 +260,7 @@ func TestCandidatesFallBackToAlternateDomain(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		_, _ = w.Write([]byte(`{"code":20000,"configs":[{"SSConf":{"server":"` +
+		_, _ = w.Write([]byte(`{"code":0,"configs":[{"SSConf":{"server":"` +
 			host + `","port":` + portText + `,"password":"test","method":"aes-256-gcm"}}]}`))
 	}))
 	defer backup.Close()
@@ -279,10 +280,56 @@ func TestCandidatesFallBackToAlternateDomain(t *testing.T) {
 }
 
 func TestAPIResultValidation(t *testing.T) {
-	if err := (apiResult{Code: 20000}).validate(); err != nil {
+	if err := (apiResult{Code: 0}).validate(); err != nil {
 		t.Fatal(err)
 	}
 	if err := (apiResult{Code: 40101, Error: "invalid"}).validate(); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestTrojanAPKTLSShape(t *testing.T) {
+	for _, verify := range []string{``, `,"verify":true`, `,"verify":false`} {
+		var remote remoteConfig
+		data := `{"trojanConf":{"server":"proxy.example","port":443,"password":"test","ssl":{"sni":"tls.example"` + verify + `}}}`
+		if err := json.Unmarshal([]byte(data), &remote); err != nil {
+			t.Fatal(err)
+		}
+		got := extractCandidates([]remoteConfig{remote})
+		if len(got) != 1 || !got[0].TLS.Enabled || got[0].TLS.ServerName != "tls.example" || got[0].TLS.Insecure != strings.Contains(verify, "false") {
+			t.Fatalf("incorrect TLS translation for %s: %+v", verify, got)
+		}
+	}
+}
+
+func TestAuthenticationCodes(t *testing.T) {
+	for _, code := range []int{20001, 20006, 20010, 40015} {
+		if !IsAuthenticationError((apiResult{Code: code}).validate()) {
+			t.Fatalf("missing auth code %d", code)
+		}
+	}
+	if IsAuthenticationError(&APIError{Code: 40021}) {
+		t.Fatal("membership expiry must not cause login retry")
+	}
+	if (apiResult{Code: 20000}).validate() == nil {
+		t.Fatal("APK treats 20000 as an error")
+	}
+}
+
+func TestLoginSurvivesUnavailableDiscovery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/1/ip" {
+			http.Error(w, "unavailable", 503)
+			return
+		}
+		_, _ = w.Write([]byte(`{"token":{"access_token":"test"}}`))
+	}))
+	defer server.Close()
+	cfg := config.Defaults()
+	cfg.APIDomains = []string{server.URL}
+	client := New(cfg)
+	defer client.Close()
+	if _, err := client.Authenticate(context.Background(), config.Credentials{AuthBy: "username", Username: "test", Password: "test"}); err != nil {
+		t.Fatal(err)
 	}
 }
